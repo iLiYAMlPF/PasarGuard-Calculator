@@ -68,12 +68,29 @@ At the end you should see `✅ Bot is running.`
 | `/closeweek` | Close the current week manually (asks for confirmation) |
 | `/total` | All-time total |
 | `/weeks` | List of closed weeks |
+| `/analyze` | Full analysis: totals, averages, share of each owner, biggest accounts, weekly list |
+| `/analyze help` | How to import old messages |
+| `/version` | Shows the installed bot version |
+| `/update` | Checks GitHub for a new version and updates the bot (owner only). `/update force` updates even if the version number is the same |
 | `/myid` | Shows your numeric Telegram ID |
 
 Add `short` or `full` to a report command, e.g. `/total full` or `/week short`.
 
 After a week is closed (manually or automatically) it is no longer included in `/week`; counting starts from zero for the new week.
 Closed weeks stay in `/total` and `/weeks`.
+
+## Analyze old messages
+
+Telegram bots **cannot read old group messages**, so history must be imported once from a chat export:
+
+1. On **Telegram Desktop** (computer) open the group → ⋮ menu → **Export chat history**.
+2. Turn off all media (photos, videos, files…) so only messages are exported.
+3. Set the format to **Machine-readable JSON** and export.
+4. Send the resulting `result.json` to the bot in a **private chat** (requires `OWNER_IDS` to be set).
+
+The bot reads every `#Create_User` message, splits them into the correct Iranian weeks (closed weeks + the current open week) and replies with a full analysis.
+Re-sending the same file is safe: already-known messages are skipped. Week numbers are re-sorted by date after an import.
+Use `/analyze` any time later to see the analysis again. Files up to 20 MB are supported.
 
 ## Configuration
 
@@ -90,20 +107,52 @@ Edit `/opt/sum-bot/.env`, then run `systemctl restart sum-bot`.
 | `WEEK_END_TIME` | `23:59` | Time (Tehran) of the automatic close |
 | `TIMEZONE` | `Asia/Tehran` | Timezone used for week boundaries and dates |
 | `COUNT_TAGS` | `#Create_User` | Which PasarGuard notifications are counted |
+| `UPDATE_CHECK` | `1` | Check GitHub every 12 h and message the owners when a new version exists |
+| `VERSION_URL` | repo's raw `VERSION` | Where the latest version number is read from |
+| `UPDATE_BRANCH` | `main` | Branch used by `/update` |
 | `REPLY_EACH` | `0` | `1` = reply to every counted message |
 | `REACT` | `1` | `1` = react with 👍 to counted messages |
 
 ## Update
 
-Run the install command again. The code is updated; `.env` and `data.db` are kept.
+### Publishing a new version (you, on GitHub)
+1. Edit the files in the repository (e.g. `sum_bot.py`).
+2. Change the number in the `VERSION` file (e.g. `1.0.0` → `1.1.0`).
+3. Optionally describe the change in `CHANGELOG.md`.
+4. Commit to the `main` branch.
+
+### Updating the server
+Pick one:
+
+- **From the server:** `sum-bot update`
+- **From Telegram:** send `/update` to the bot (private chat, owner only), then press **Update**.
+  If `UPDATE_CHECK=1` the bot also messages you by itself when a new version appears
+  (start the bot once in a private chat so it is allowed to write to you).
+- **Re-run the installer:** the same command as the install step.
+
+Your `.env` and `data.db` are always kept. The bot restarts for a few seconds.
+
+> Servers installed before the update system existed need to run the install command **once** to get the `sum-bot` command and `/update`.
+
+### The `sum-bot` command
+
+| Command | Description |
+|---|---|
+| `sum-bot update` | Download the latest version and restart |
+| `sum-bot version` | Show the installed version |
+| `sum-bot status` | Service status |
+| `sum-bot logs` | Live logs |
+| `sum-bot restart` | Restart the bot |
+| `sum-bot config` | Edit `.env` and restart |
+| `sum-bot uninstall` | Remove the bot (keeps a DB backup in `/root`) |
 
 ## Uninstall
 
 ```bash
-systemctl stop sum-bot && systemctl disable sum-bot
-rm /etc/systemd/system/sum-bot.service && systemctl daemon-reload
-rm -rf /opt/sum-bot
+sum-bot uninstall
 ```
+
+It asks for confirmation and saves a database backup to `/root/sum-bot-data.db.bak`.
 
 ## Troubleshooting
 

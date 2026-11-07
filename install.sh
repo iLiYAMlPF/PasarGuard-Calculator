@@ -5,6 +5,7 @@
 #   bash <(curl -fsSL https://raw.githubusercontent.com/iLiYAMlPF/PasarGuard-Calculator/main/install.sh)
 #
 # Re-running this script updates the code and keeps your .env and data.db.
+# After installation you can also use:  sum-bot update
 set -euo pipefail
 
 # Never run from inside the install directory (it may be moved/replaced)
@@ -80,6 +81,62 @@ if [ ! -f "$DIR/.env" ]; then
 fi
 chmod 600 "$DIR/.env"
 
+# --- CLI begin
+echo "==> Installing the 'sum-bot' command"
+{
+  echo '#!/usr/bin/env bash'
+  echo "DIR=\"$DIR\""
+  echo "SERVICE=\"$SERVICE\""
+  echo "BRANCH=\"$BRANCH\""
+  cat <<'CLI'
+ver() { cat "$DIR/VERSION" 2>/dev/null || echo unknown; }
+case "${1:-help}" in
+  update)
+    [ "$(id -u)" -eq 0 ] || { echo "Run as root (sudo sum-bot update)"; exit 1; }
+    old="$(ver)"
+    git -C "$DIR" fetch --quiet origin "$BRANCH"
+    git -C "$DIR" reset --hard --quiet "origin/$BRANCH"
+    "$DIR/venv/bin/pip" install --quiet -r "$DIR/requirements.txt"
+    systemctl restart "$SERVICE"
+    echo "✅ Updated: $old -> $(ver)"
+    ;;
+  version) echo "Sum Bot version: $(ver)" ;;
+  status)  systemctl status "$SERVICE" --no-pager ;;
+  logs)    journalctl -u "$SERVICE" -f ;;
+  restart) systemctl restart "$SERVICE" && echo "Restarted." ;;
+  config)  "${EDITOR:-nano}" "$DIR/.env" && systemctl restart "$SERVICE" && echo "Restarted." ;;
+  uninstall)
+    [ "$(id -u)" -eq 0 ] || { echo "Run as root"; exit 1; }
+    read -r -p "This removes the bot and its settings. Type YES to continue: " a
+    [ "$a" = "YES" ] || { echo "Cancelled."; exit 0; }
+    if [ -f "$DIR/data.db" ]; then
+      cp "$DIR/data.db" /root/sum-bot-data.db.bak && echo "Database backup: /root/sum-bot-data.db.bak"
+    fi
+    systemctl stop "$SERVICE" 2>/dev/null || true
+    systemctl disable "$SERVICE" 2>/dev/null || true
+    rm -f "/etc/systemd/system/$SERVICE.service"
+    systemctl daemon-reload
+    rm -rf "$DIR"
+    rm -f /usr/local/bin/sum-bot
+    echo "Removed."
+    ;;
+  *)
+    echo "Sum Bot $(ver)"
+    echo "Usage: sum-bot <command>"
+    echo "  update     download the latest version from GitHub and restart"
+    echo "  version    show the installed version"
+    echo "  status     show service status"
+    echo "  logs       follow live logs"
+    echo "  restart    restart the bot"
+    echo "  config     edit .env and restart"
+    echo "  uninstall  remove the bot (keeps a database backup)"
+    ;;
+esac
+CLI
+} > /usr/local/bin/sum-bot
+chmod +x /usr/local/bin/sum-bot
+# --- CLI end
+
 echo "==> Creating systemd service"
 cat > "/etc/systemd/system/$SERVICE.service" <<UNIT
 [Unit]
@@ -114,9 +171,13 @@ if systemctl is-active --quiet "$SERVICE"; then
   echo "  - Send /myid in the group, put the number in OWNER_IDS if you skipped it:"
   echo "      nano $DIR/.env && systemctl restart $SERVICE"
   echo
-  echo "Useful commands:"
-  echo "  journalctl -u $SERVICE -f        # live logs"
-  echo "  systemctl restart $SERVICE       # restart after editing .env"
+  echo "Installed version: $(cat "$DIR/VERSION" 2>/dev/null || echo unknown)"
+  echo
+  echo "Useful commands (run 'sum-bot' to see all):"
+  echo "  sum-bot update      # update to the latest version from GitHub"
+  echo "  sum-bot logs        # live logs"
+  echo "  sum-bot config      # edit settings and restart"
+  echo "You can also send /update to the bot in Telegram (owner only)."
 else
   echo "❌ The service failed to start. Last logs:"
   journalctl -u "$SERVICE" -n 20 --no-pager
