@@ -1,5 +1,7 @@
 # PasarGuard Calculator (Sum Bot)
 
+🇮🇷 **[توضیحات کامل فارسی (Persian README)](README.fa.md)**
+
 A Telegram bot that sums the **Data Limit** of users created by the [PasarGuard](https://github.com/PasarGuard/panel) panel
 (`#Create_User` notifications), grouped by **Belongs To**. It gives you weekly and all-time reports.
 The Iranian week is closed automatically every **Friday at 23:59 (Tehran time)**.
@@ -118,16 +120,4 @@ journalctl -u sum-bot -n 50 --no-pager
 
 ---
 
-## خلاصه‌ی فارسی
-
-ربات تلگرام برای جمع زدن حجم (Data Limit) کاربران ساخته‌شده در پنل پاسارگارد، به تفکیک `Belongs To`، با گزارش هفتگی و جمع کل.
-هفته‌ی ایرانی هر جمعه ساعت ۲۳:۵۹ (وقت تهران) خودکار بسته می‌شود.
-
-**نصب:** یک ربات جدید در @BotFather بسازید، بعد روی سرور (به‌جز داخل پوشه‌ی `/opt/sum-bot`) این را اجرا کنید و به ۴ سؤال جواب بدهید (توکن، آیدی گروه، آیدی تاپیک، آیدی عددی خودتان):
-
-```bash
-cd /
-bash <(curl -fsSL https://raw.githubusercontent.com/iLiYAMlPF/PasarGuard-Calculator/main/install.sh)
-```
-
-بعد ربات را ادمین گروه کنید، `/setprivacy` را Disable کنید و Bot-to-Bot Communication Mode را برای هر دو ربات (پاسارگارد و این ربات) در @BotFather روشن کنید.
+🇮🇷 توضیحات کامل فارسی: [README.fa.md](README.fa.md)
