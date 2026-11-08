@@ -70,6 +70,14 @@ At the end you should see `✅ Bot is running.`
 | `/weeks` | List of closed weeks |
 | `/analyze` | Full analysis: totals, averages, share of each owner, biggest accounts, weekly list |
 | `/analyze help` | How to import old messages |
+| `/price` | Show prices. `/price MSN 1500` = toman per GB for one *Belongs To*, `/price all 1000` = default, `/price MSN off` = remove |
+| `/userprice Ali 90000` | Fixed price for one username (overrides the per-GB price) |
+| `/sales` | Sales in toman per *Belongs To*: current week; `/sales 3` a closed week; `/sales total` everything; add `full` for per-user lines |
+| `/add Ali 30 MSN` | Add a record manually (username, size, Belongs To) |
+| `/remove Ali` | Remove a record (shows buttons to pick which one) |
+| `/backup` | Sends a backup of the database (private chat only) |
+| `/status` | Diagnostics: IDs, admin rights, whether PasarGuard messages are seen |
+| `/help` | Command list |
 | `/version` | Shows the installed bot version |
 | `/update` | Checks GitHub for a new version and updates the bot (owner only). `/update force` updates even if the version number is the same |
 | `/myid` | Shows your numeric Telegram ID |
@@ -92,6 +100,22 @@ The bot reads every `#Create_User` message, splits them into the correct Iranian
 Re-sending the same file is safe: already-known messages are skipped. Week numbers are re-sorted by date after an import.
 Use `/analyze` any time later to see the analysis again. Files up to 20 MB are supported.
 
+## Prices and sales
+
+1. Set a price per GB: `/price MSN 1500` (for one *Belongs To*) or `/price all 1000` (default for everyone else).
+2. Optional fixed price for a single user: `/userprice Ali 90000`.
+3. `/sales` shows how many toman each *Belongs To* sold. When prices exist, the sales report is also sent automatically after every weekly close.
+
+## Backup and restore
+
+- `/backup` in a private chat sends you the database file. With `AUTO_BACKUP=1` a backup is also sent after every automatic weekly close.
+- **Restore:** send that `.db` file to the bot in a private chat and press **Restore**. A safety copy of the current data is saved next to the database first.
+- The backup contains no token (the token lives only in `.env`).
+
+## Troubleshooting: the bot does not record new users
+
+Send `/status` **inside the topic where PasarGuard posts**. It shows the chat and topic ID, whether the bot is admin and can delete messages, and whether it has seen a `#Create_User` message (and why it was ignored). If PasarGuard posts to a **channel**, add the bot to the channel as an admin.
+
 ## Configuration
 
 Edit `/opt/sum-bot/.env`, then run `systemctl restart sum-bot`.
@@ -110,6 +134,9 @@ Edit `/opt/sum-bot/.env`, then run `systemctl restart sum-bot`.
 | `UPDATE_CHECK` | `1` | Check GitHub every 12 h and message the owners when a new version exists |
 | `VERSION_URL` | repo's raw `VERSION` | Where the latest version number is read from |
 | `UPDATE_BRANCH` | `main` | Branch used by `/update` |
+| `DELETE_PATTERNS` | `User not found` | Messages containing these texts are deleted (separate several with `|`, empty = off). The bot must be admin with *Delete messages* |
+| `AUTO_BACKUP` | `1` | Send a backup to the owners (private chat) after every automatic weekly close |
+| `CURRENCY` | `تومان` | Currency label in sales reports |
 | `REPLY_EACH` | `0` | `1` = reply to every counted message |
 | `REACT` | `1` | `1` = react with 👍 to counted messages |
 

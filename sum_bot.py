@@ -14,6 +14,11 @@
     /analyze help    آموزش ایمپورت پیام‌های قدیمی (فایل result.json را در پیوی ربات بفرستید)
     /version         نسخه‌ی ربات
     /update          بررسی و آپدیت ربات از GitHub (فقط OWNER_IDS)؛ /update force برای آپدیت اجباری
+    /sales [شماره|total] [full]   فروش به تومان (بعد از تعیین قیمت)
+    /price [owner|all مبلغ]       قیمت هر گیگ؛ /userprice نام مبلغ = قیمت ثابت یک کاربر
+    /add نام حجم owner            افزودن دستی؛ /remove نام = حذف
+    /backup                       بکاپ دیتابیس (پیوی)؛ فایل .db را بفرستید تا ریستور شود
+    /status                       عیب‌یابی؛ /help راهنما
     /myid            آیدی عددی خودتان (برای تنظیم OWNER_IDS)
     به همه‌ی گزارش‌ها می‌توانید short (خلاصه) یا full (کامل) اضافه کنید
 
@@ -33,6 +38,8 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.request
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -70,6 +77,10 @@ WEEK_END_DAY = os.getenv("WEEK_END_DAY", "fri").lower()  # sat sun mon tue wed t
 WEEK_END_TIME = os.getenv("WEEK_END_TIME", "23:59")
 DAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 DAY_FA = {0: "دوشنبه", 1: "سه‌شنبه", 2: "چهارشنبه", 3: "پنجشنبه", 4: "جمعه", 5: "شنبه", 6: "یکشنبه"}
+# پیام‌هایی که ربات حذف می‌کند (چند عبارت را با | جدا کنید؛ خالی = خاموش). ربات باید ادمین با دسترسی Delete messages باشد
+DELETE_PATTERNS = [
+    x.strip().lower() for x in os.getenv("DELETE_PATTERNS", "User not found").split("|") if x.strip()
+]
 COUNT_TAGS = {
     t.strip().lower()
     for t in os.getenv("COUNT_TAGS", "#Create_User").split(",")
@@ -85,6 +96,9 @@ VERSION_URL = os.getenv(
     "https://raw.githubusercontent.com/iLiYAMlPF/PasarGuard-Calculator/main/VERSION",
 )
 UPDATE_CHECK = os.getenv("UPDATE_CHECK", "1") == "1"  # هر ۱۲ ساعت نسخه‌ی جدید را چک کند و به OWNER_IDS خبر بدهد
+AUTO_BACKUP = os.getenv("AUTO_BACKUP", "1") == "1"  # بعد از هر بستن خودکار هفته، بکاپ به پیوی مالک‌ها برود
+CURRENCY = os.getenv("CURRENCY", "تومان")
+RESTORE_TMP = os.getenv("DB_PATH", "data.db") + ".restore"
 
 try:
     from zoneinfo import ZoneInfo
@@ -161,6 +175,11 @@ def parse_message(text: str):
     return results
 
 
+def should_delete(text: str) -> bool:
+    low = (text or "").lower()
+    return any(p in low for p in DELETE_PATTERNS)
+
+
 def fmt_gb(x: float) -> str:
     s = f"{x:.2f}".rstrip("0").rstrip(".")
     return f"{s} GB"
@@ -189,6 +208,12 @@ def db():
     )
     con.execute("CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY, thread_id INTEGER)")
     con.execute("CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT)")
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS prices (chat_id INTEGER, owner TEXT, per_gb REAL, PRIMARY KEY (chat_id, owner))"
+    )
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS user_prices (chat_id INTEGER, account TEXT, price REAL, PRIMARY KEY (chat_id, account))"
+    )
     return con
 
 
@@ -626,8 +651,272 @@ def owner_only(update: Update) -> bool:
     return bool(OWNER_IDS and u and u.id in OWNER_IDS)
 
 
+# ---------- پول و فروش ----------
+def money(x: float) -> str:
+    return f"{x:,.0f} {CURRENCY}"
+
+
+def parse_number(txt):
+    t = str(txt).replace(",", "").replace("٬", "").strip()
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def parse_size(txt):
+    m = re.match(r"^(\d+(?:[.,]\d+)?)\s*(mb|gb|tb)?$", txt.strip(), re.I)
+    if not m:
+        return None
+    return float(m.group(1).replace(",", ".")) * UNITS[(m.group(2) or "GB").upper()]
+
+
+def get_prices(chat_id):
+    """(قیمت پیش‌فرض هر گیگ, {owner_lower: per_gb}, {account_lower: price})"""
+    con = db()
+    default, owners, users = None, {}, {}
+    for owner, per_gb in con.execute("SELECT owner, per_gb FROM prices WHERE chat_id=?", (chat_id,)):
+        if owner == "*":
+            default = per_gb
+        else:
+            owners[owner.lower()] = per_gb
+    for account, price in con.execute("SELECT account, price FROM user_prices WHERE chat_id=?", (chat_id,)):
+        users[account.lower()] = price
+    con.close()
+    return default, owners, users
+
+
+def list_prices(chat_id):
+    con = db()
+    owners = con.execute(
+        "SELECT owner, per_gb FROM prices WHERE chat_id=? AND owner<>'*' ORDER BY owner", (chat_id,)
+    ).fetchall()
+    users = con.execute(
+        "SELECT account, price FROM user_prices WHERE chat_id=? ORDER BY account", (chat_id,)
+    ).fetchall()
+    con.close()
+    return owners, users
+
+
+def set_owner_price(chat_id, owner, per_gb):
+    con = db()
+    with con:
+        con.execute("DELETE FROM prices WHERE chat_id=? AND lower(owner)=lower(?)", (chat_id, owner))
+        if per_gb is not None:
+            con.execute("INSERT INTO prices (chat_id, owner, per_gb) VALUES (?,?,?)", (chat_id, owner, per_gb))
+    con.close()
+
+
+def set_user_price(chat_id, account, price):
+    con = db()
+    with con:
+        con.execute("DELETE FROM user_prices WHERE chat_id=? AND lower(account)=lower(?)", (chat_id, account))
+        if price is not None:
+            con.execute(
+                "INSERT INTO user_prices (chat_id, account, price) VALUES (?,?,?)", (chat_id, account, price)
+            )
+    con.close()
+
+
+def has_prices(chat_id) -> bool:
+    d, o, u = get_prices(chat_id)
+    return d is not None or bool(o) or bool(u)
+
+
+def build_sales_report(title, rows, prices, full=False, note=None):
+    default, owners, users = prices
+    if not rows:
+        return [f"{title}\n{SEP}\nهنوز چیزی ثبت نشده."]
+    groups = defaultdict(list)
+    for owner, account, gb, _ in rows:
+        price = None
+        if account.lower() in users:
+            price = users[account.lower()]
+        else:
+            per_gb = owners.get(owner.lower(), default)
+            if per_gb is not None:
+                price = per_gb * gb
+        groups[owner].append((account, gb, price))
+
+    def owner_sum(us):
+        return sum(p for _, _, p in us if p is not None)
+
+    lines = [title]
+    if note:
+        lines.append(note)
+    lines.append(SEP)
+    grand = total_gb = 0.0
+    unpriced = 0
+    for owner, us in sorted(groups.items(), key=lambda kv: -owner_sum(kv[1])):
+        s_owner = owner_sum(us)
+        gbs = sum(g for _, g, _ in us)
+        miss = sum(1 for _, _, p in us if p is None)
+        grand += s_owner
+        total_gb += gbs
+        unpriced += miss
+        lines.append(f"👤 {owner} — {len(us)} کاربر — {fmt_gb(gbs)}")
+        lines.append(f"   💵 {money(s_owner)}" + (f"   ⚠️ {miss} بدون قیمت" if miss else ""))
+        if full:
+            for account, gb, price in sorted(us, key=lambda x: -(x[2] or 0)):
+                lines.append(f"   • {account} — {fmt_gb(gb)} — {money(price) if price is not None else 'بدون قیمت'}")
+        lines.append("")
+    if lines[-1] == "":
+        lines.pop()
+    lines += [SEP, f"💰 جمع فروش: {money(grand)}", f"📦 {fmt_gb(total_gb)} | 👥 {len(rows)} کاربر"]
+    if unpriced:
+        lines.append("⚠️ برای کاربرهای بدون قیمت: /price یا /userprice")
+    return chunk_text("\n".join(lines))
+
+
+def sales_chunks(chat_id, scope, title, full=False):
+    if not has_prices(chat_id):
+        return None
+    return build_sales_report(title, get_rows(chat_id, scope), get_prices(chat_id), full)
+
+
+# ---------- افزودن و حذف دستی ----------
+def ensure_chat(chat_id):
+    con = db()
+    with con:
+        con.execute(
+            "INSERT OR IGNORE INTO chats (chat_id, thread_id) VALUES (?,?)",
+            (chat_id, None if TOPIC_ID == 1 else TOPIC_ID),
+        )
+    con.close()
+
+
+def add_manual(chat_id, account, gb, owner):
+    ensure_chat(chat_id)
+    con = db()
+    try:
+        with con:
+            mid = -int(time.time() * 1000)
+            while con.execute("SELECT 1 FROM entries WHERE chat_id=? AND message_id=?", (chat_id, mid)).fetchone():
+                mid -= 1
+            con.execute(
+                "INSERT INTO entries (chat_id, message_id, idx, sender_id, sender_name, owner, gb, account,"
+                " week_id, created_at) VALUES (?,?,?,?,?,?,?,?,NULL,?)",
+                (chat_id, mid, 0, 0, "manual", owner, gb, account, now_iso()),
+            )
+    finally:
+        con.close()
+
+
+def find_entries(chat_id, account):
+    con = db()
+    rows = con.execute(
+        "SELECT e.rowid, e.owner, e.account, e.gb, w.number FROM entries e"
+        " LEFT JOIN weeks w ON w.id = e.week_id"
+        " WHERE e.chat_id=? AND lower(e.account)=lower(?) ORDER BY e.created_at DESC LIMIT 10",
+        (chat_id, account),
+    ).fetchall()
+    con.close()
+    return rows
+
+
+def delete_entry(rowid):
+    con = db()
+    try:
+        with con:
+            row = con.execute(
+                "SELECT chat_id, owner, account, gb, week_id FROM entries WHERE rowid=?", (rowid,)
+            ).fetchone()
+            if not row:
+                return None
+            chat_id, owner, account, gb, week_id = row
+            con.execute("DELETE FROM entries WHERE rowid=?", (rowid,))
+            if week_id:
+                tot, cnt, first = con.execute(
+                    "SELECT COALESCE(SUM(gb),0), COUNT(*), MIN(created_at) FROM entries WHERE week_id=?",
+                    (week_id,),
+                ).fetchone()
+                if cnt == 0:
+                    con.execute("DELETE FROM weeks WHERE id=?", (week_id,))
+                    ids = [
+                        r[0]
+                        for r in con.execute(
+                            "SELECT id FROM weeks WHERE chat_id=? ORDER BY closed_at, id", (chat_id,)
+                        )
+                    ]
+                    for n, wid in enumerate(ids, 1):
+                        con.execute("UPDATE weeks SET number=? WHERE id=?", (n, wid))
+                else:
+                    con.execute(
+                        "UPDATE weeks SET total_gb=?, count=?, started_at=? WHERE id=?",
+                        (tot, cnt, first, week_id),
+                    )
+            return {"owner": owner, "account": account, "gb": gb, "closed": bool(week_id)}
+    finally:
+        con.close()
+
+
+# ---------- بکاپ و ریستور ----------
+def backup_name() -> str:
+    return "sum-bot-backup-" + datetime.now(TZ).strftime("%Y%m%d-%H%M") + ".db"
+
+
+def make_backup_file():
+    db().close()
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    src, dst = sqlite3.connect(DB_PATH), sqlite3.connect(path)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    return path
+
+
+def inspect_backup(path):
+    try:
+        con = sqlite3.connect(path)
+        try:
+            if con.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                return {"error": "فایل بکاپ خراب است."}
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "entries" not in tables:
+                return {"error": "این فایل، بکاپ این ربات نیست."}
+
+            def count(t):
+                return con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] if t in tables else 0
+
+            return {
+                "entries": count("entries"),
+                "weeks": count("weeks"),
+                "prices": count("prices") + count("user_prices"),
+            }
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return {"error": "فایل بکاپ معتبر نیست."}
+
+
+def do_restore(path):
+    safety = None
+    if os.path.exists(DB_PATH):
+        safety = f"{DB_PATH}.before-restore-{datetime.now(TZ).strftime('%Y%m%d-%H%M%S')}"
+        a, b = sqlite3.connect(DB_PATH), sqlite3.connect(safety)
+        try:
+            a.backup(b)
+        finally:
+            b.close()
+            a.close()
+    src, dst = sqlite3.connect(path), sqlite3.connect(DB_PATH)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    os.remove(path)
+    db().close()  # مهاجرت ستون‌ها/جدول‌های جدید برای بکاپ‌های قدیمی
+    return safety
+
+
 # ---------- کمکی ----------
 def in_topic(msg) -> bool:
+    if msg.chat.type == "channel":
+        return True
     tid = msg.message_thread_id if msg.is_topic_message else None
     if TOPIC_ID == 1:  # تاپیک General
         return tid in (None, 1)
@@ -691,9 +980,17 @@ async def send_chunks(msg, chunks, reply_markup=None):
 
 # ---------- هندلرها ----------
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update, context):
-        return
     msg = update.effective_message
+    if msg is None:
+        return
+    if not allowed(update, context):
+        if TAG_RE.search(msg.text or ""):
+            log.info(
+                "پیام #Create_User نادیده گرفته شد (chat=%s topic=%s). در همان تاپیک /status را بزنید.",
+                msg.chat_id,
+                msg.message_thread_id,
+            )
+        return
     items = parse_message(msg.text or "")
     if not items:
         return
@@ -703,7 +1000,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not save_entries(msg.chat_id, msg.message_id, sender_id, sender_name, items, created):
         log.info("پیام %s در هفته‌ی بسته‌شده است؛ ویرایش نادیده گرفته شد", msg.message_id)
         return
-    if update.edited_message is not None:
+    if update.edited_message is not None or update.edited_channel_post is not None:
         return
     if REPLY_EACH:
         gb, owner, account = items[0]
@@ -822,6 +1119,9 @@ async def on_close_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         note=f"✅ از این به بعد ثبت‌ها برای هفته‌ی {w['number'] + 1} است",
     )
     await send_chunks(q.message, chunks)
+    sc = sales_chunks(chat_id, w["id"], f"💰 فروش هفته {w['number']}")
+    if sc:
+        await send_chunks(q.message, sc)
 
 
 async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -857,8 +1157,15 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid not in OWNER_IDS:
         return
     doc = msg.document
-    if not (doc.file_name or "").lower().endswith(".json"):
-        await msg.reply_text("فایل باید result.json باشد (خروجی Machine-readable JSON). راهنما: /analyze help")
+    fname = (doc.file_name or "").lower()
+    if fname.endswith(".db") or fname.endswith(".sqlite"):
+        await handle_restore_file(msg, doc)
+        return
+    if not fname.endswith(".json"):
+        await msg.reply_text(
+            "فایل باید result.json (برای ایمپورت پیام‌های قدیمی) یا فایل بکاپ .db (برای ریستور) باشد.\n"
+            "راهنما: /analyze help"
+        )
         return
     if doc.file_size and doc.file_size > 20 * 1024 * 1024:
         await msg.reply_text("فایل بزرگ‌تر از ۲۰ مگابایت است. هنگام Export رسانه‌ها را خاموش کنید یا بازه‌ی زمانی را کوتاه کنید.")
@@ -980,6 +1287,393 @@ async def update_check_loop(app):
         await asyncio.sleep(12 * 3600)
 
 
+HELP_TEXT = (
+    "📖 دستورها\n\n"
+    "گزارش:\n"
+    "/week [شماره] — هفته‌ی جاری یا یک هفته‌ی بسته‌شده\n"
+    "/total — جمع کل | /weeks — فهرست هفته‌ها | /analyze — تحلیل کامل\n"
+    "/closeweek — بستن دستی هفته\n\n"
+    "حساب و کتاب:\n"
+    "/price — نمایش قیمت‌ها | /price MSN 1500 — قیمت هر گیگ برای یک Belongs To\n"
+    "/price all 1000 — قیمت پیش‌فرض | /userprice Ali 90000 — قیمت ثابت یک کاربر\n"
+    "/sales [شماره|total] [full] — فروش به تومان\n\n"
+    "ویرایش داده:\n"
+    "/add Ali 30 MSN — افزودن دستی | /remove Ali — حذف\n\n"
+    "بکاپ و نگهداری:\n"
+    "/backup — فایل بکاپ (در پیوی) | فایل .db را در پیوی بفرستید تا ریستور شود\n"
+    "/status — عیب‌یابی | /version | /update"
+)
+
+SEEN = {"others": 0, "last_tag": None}
+
+
+async def pre_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """قبل از بقیه اجرا می‌شود: آمار عیب‌یابی + حذف پیام‌های ناخواسته‌ی ربات‌های دیگر."""
+    msg = update.effective_message
+    if msg is None or msg.chat.type == "private":
+        return
+    text = msg.text or ""
+    u = msg.from_user
+    from_other = bool((u and u.is_bot and u.id != context.bot.id) or msg.chat.type == "channel")
+    if not from_other:
+        return
+    SEEN["others"] += 1
+    if TAG_RE.search(text):
+        SEEN["last_tag"] = {
+            "chat": msg.chat_id,
+            "type": msg.chat.type,
+            "thread": msg.message_thread_id if msg.is_topic_message else None,
+            "time": time.time(),
+        }
+    if should_delete(text) and (not CHAT_ID or msg.chat_id == CHAT_ID):
+        try:
+            await msg.delete()
+        except Exception as e:  # noqa: BLE001
+            log.warning("حذف پیام ناموفق (ربات باید ادمین با دسترسی Delete messages باشد): %s", e)
+
+
+async def need_owner(update: Update) -> bool:
+    msg = update.effective_message
+    if msg is None:
+        return False
+    if not OWNER_IDS:
+        await msg.reply_text(
+            "این دستور فقط برای مالک است. اول OWNER_IDS را در .env بگذارید (آیدی شما با /myid)، "
+            "بعد: sum-bot restart"
+        )
+        return False
+    return owner_only(update)
+
+
+async def get_chat_or_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if msg is None:
+        return None
+    if msg.chat.type == "private":
+        cid = CHAT_ID or single_known_chat()
+        if not cid:
+            await msg.reply_text("هنوز گروهی ثبت نشده. CHAT_ID را در .env بگذارید یا اول یک پیام در گروه ثبت شود.")
+        return cid
+    return msg.chat_id if allowed(update, context) else None
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if msg is None or not command_ok(update):
+        return
+    await msg.reply_text(HELP_TEXT)
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if msg is None or not command_ok(update):
+        return
+    here_thread = msg.message_thread_id if msg.is_topic_message else None
+    lines = [
+        f"🩺 وضعیت ربات — نسخه {local_version()}",
+        SEP,
+        f"• این چت: {msg.chat_id} | این تاپیک: {here_thread or 'General / بدون تاپیک'}",
+        f"• تنظیم‌شده: CHAT_ID={CHAT_ID or 'خالی'} | TOPIC_ID={TOPIC_ID}",
+    ]
+    try:
+        me = await context.bot.get_me()
+        priv = getattr(me, "can_read_all_group_messages", None)
+        if priv is not None:
+            lines.append("• Privacy خاموش است: " + ("بله ✅" if priv else "خیر ❌ (در BotFather: /setprivacy ← Disable)"))
+    except Exception:  # noqa: BLE001
+        pass
+    if msg.chat.type in ("group", "supergroup", "channel"):
+        try:
+            m = await context.bot.get_chat_member(msg.chat_id, context.bot.id)
+            is_adm = m.status in ("administrator", "creator")
+            can_del = m.status == "creator" or bool(getattr(m, "can_delete_messages", False))
+            lines.append("• ربات ادمین است: " + ("بله ✅" if is_adm else "خیر ❌"))
+            lines.append("• دسترسی حذف پیام: " + ("بله ✅" if can_del else "خیر ❌ (برای حذف «User not found»)"))
+        except Exception:  # noqa: BLE001
+            pass
+    lines.append(f"• پیام‌های ربات‌ها/کانال‌ها که از آخرین ریستارت دیده‌ام: {SEEN['others']}")
+    lt = SEEN["last_tag"]
+    if lt:
+        mins = int((time.time() - lt["time"]) / 60)
+        if CHAT_ID and lt["chat"] != CHAT_ID:
+            verdict = f"❌ نادیده گرفته می‌شود: CHAT_ID فرق دارد (چت واقعی: {lt['chat']})"
+        elif lt["type"] != "channel" and not (
+            (lt["thread"] in (None, 1)) if TOPIC_ID == 1 else (lt["thread"] == TOPIC_ID)
+        ):
+            verdict = f"❌ نادیده گرفته می‌شود: تاپیک فرق دارد (تاپیک واقعی: {lt['thread']}، TOPIC_ID را همین بگذارید)"
+        else:
+            verdict = "✅ شمرده می‌شود"
+        lines.append(f"• آخرین #Create_User: {mins} دقیقه پیش — چت {lt['chat']} — تاپیک {lt['thread']} — {verdict}")
+    else:
+        lines.append(
+            "• از آخرین ریستارت هیچ پیام #Create_User ندیده‌ام. اگر پاسارگارد پیام فرستاده، یعنی "
+            "Bot-to-Bot Mode خاموش است یا ربات ادمین/Privacy درست نیست یا پیام در چت دیگری می‌آید."
+        )
+    con = db()
+    n = con.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+    con.close()
+    lines.append(f"• ثبت‌شده در دیتابیس: {n} کاربر")
+    await msg.reply_text("\n".join(lines))
+
+
+async def cmd_sales(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if msg is None or not command_ok(update):
+        return
+    chat_id = await get_chat_or_reply(update, context)
+    if not chat_id:
+        return
+    args = [a.lower() for a in (context.args or [])]
+    full = "full" in args or "کامل" in args
+    prices = get_prices(chat_id)
+    if prices[0] is None and not prices[1] and not prices[2]:
+        await msg.reply_text("هنوز قیمتی تعیین نشده. مثال:\n/price MSN 1500\n/price all 1000")
+        return
+    number = next((int(a) for a in args if a.isdigit()), None)
+    if "total" in args or "کل" in args:
+        rows, title = get_rows(chat_id, "all"), "💰 فروش کل همه‌ی هفته‌ها"
+    elif number is not None:
+        w = get_week(chat_id, number)
+        if not w:
+            await msg.reply_text(f"هفته‌ی {number} پیدا نشد. با /weeks فهرست را ببینید.")
+            return
+        rows, title = get_rows(chat_id, w[0]), "💰 فروش " + closed_title(w[1], w[2], w[3])
+    else:
+        rows = get_rows(chat_id, "open")
+        title = "💰 فروش هفته‌ی جاری"
+    await send_chunks(msg, build_sales_report(title, rows, prices, full))
+
+
+async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if msg is None or not command_ok(update):
+        return
+    chat_id = await get_chat_or_reply(update, context)
+    if not chat_id:
+        return
+    args = context.args or []
+    if not args:
+        default, _, _ = get_prices(chat_id)
+        owners, users = list_prices(chat_id)
+        lines = [
+            "💵 قیمت‌ها (به ازای هر گیگ)",
+            SEP,
+            f"پیش‌فرض: {money(default) if default is not None else 'تعیین نشده'}",
+        ]
+        lines += [f"• {o}: {money(p)}" for o, p in owners]
+        if users:
+            lines += ["", "قیمت ثابت کاربرها:"] + [f"• {a}: {money(p)}" for a, p in users[:30]]
+        lines += [
+            SEP,
+            "تنظیم: /price MSN 1500   |   /price all 1000   |   /userprice Ali 90000",
+            "حذف: /price MSN off   |   /userprice Ali off",
+        ]
+        await send_chunks(msg, chunk_text("\n".join(lines)))
+        return
+    if not await need_owner(update):
+        return
+    if len(args) < 2:
+        await msg.reply_text("مثال: /price MSN 1500   یا   /price all 1000")
+        return
+    value_txt, owner = args[-1], " ".join(args[:-1])
+    if value_txt.lower() in ("off", "حذف", "delete"):
+        value = None
+    else:
+        value = parse_number(value_txt)
+        if value is None or value < 0:
+            await msg.reply_text("قیمت باید عدد باشد. مثال: /price MSN 1500")
+            return
+    key = "*" if owner.lower() in ("all", "*", "default", "همه", "پیش‌فرض") else owner
+    set_owner_price(chat_id, key, value)
+    who = "پیش‌فرض" if key == "*" else key
+    await msg.reply_text(
+        f"✅ قیمت {who} حذف شد." if value is None else f"✅ قیمت {who}: {money(value)} به ازای هر گیگ"
+    )
+
+
+async def cmd_userprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if msg is None or not command_ok(update):
+        return
+    chat_id = await get_chat_or_reply(update, context)
+    if not chat_id or not await need_owner(update):
+        return
+    args = context.args or []
+    if len(args) != 2:
+        await msg.reply_text(
+            "مثال: /userprice Ali 90000   (قیمت کل همان کاربر، مستقل از حجم)\nحذف: /userprice Ali off"
+        )
+        return
+    account, value_txt = args
+    if value_txt.lower() in ("off", "حذف", "delete"):
+        set_user_price(chat_id, account, None)
+        await msg.reply_text(f"✅ قیمت ثابت {account} حذف شد (دوباره با قیمت هر گیگ محاسبه می‌شود).")
+        return
+    value = parse_number(value_txt)
+    if value is None or value < 0:
+        await msg.reply_text("قیمت باید عدد باشد. مثال: /userprice Ali 90000")
+        return
+    set_user_price(chat_id, account, value)
+    await msg.reply_text(f"✅ قیمت {account}: {money(value)} (برای هر ثبتِ این نام‌کاربری)")
+
+
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if msg is None or not command_ok(update):
+        return
+    chat_id = await get_chat_or_reply(update, context)
+    if not chat_id or not await need_owner(update):
+        return
+    usage = "مثال: /add Ali 30 MSN\n(نام‌کاربری، حجم، Belongs To). با واحد: /add Ali 500MB MSN"
+    args = context.args or []
+    if len(args) < 3:
+        await msg.reply_text(usage)
+        return
+    account, rest = args[0], args[1:]
+    if len(rest) >= 3 and rest[1].lower() in ("mb", "gb", "tb"):
+        size_txt, owner = rest[0] + rest[1], " ".join(rest[2:])
+    else:
+        size_txt, owner = rest[0], " ".join(rest[1:])
+    gb = parse_size(size_txt)
+    if gb is None or gb <= 0 or not owner.strip():
+        await msg.reply_text(usage)
+        return
+    await asyncio.to_thread(add_manual, chat_id, account, gb, owner.strip())
+    total = sum(r[2] for r in get_rows(chat_id, "open"))
+    await msg.reply_text(
+        f"➕ اضافه شد (هفته‌ی جاری): {account} — {fmt_gb(gb)} — {owner.strip()}\n"
+        f"📊 جمع هفته‌ی جاری: {fmt_gb(total)}"
+    )
+
+
+async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if msg is None or not command_ok(update):
+        return
+    chat_id = await get_chat_or_reply(update, context)
+    if not chat_id or not await need_owner(update):
+        return
+    if not context.args:
+        await msg.reply_text("مثال: /remove Ali   (نام‌کاربری را بدهید، ثبت‌های او را نشان می‌دهم)")
+        return
+    account = context.args[0]
+    rows = await asyncio.to_thread(find_entries, chat_id, account)
+    if not rows:
+        await msg.reply_text(f"ثبتی با نام «{account}» پیدا نشد.")
+        return
+    buttons = []
+    for rowid, owner, acc, gb, wnum in rows:
+        label = f"هفته {wnum}" if wnum else "هفته‌ی جاری"
+        buttons.append(
+            [InlineKeyboardButton(f"🗑 {acc} — {fmt_gb(gb)} — {owner} — {label}", callback_data=f"del:{rowid}")]
+        )
+    buttons.append([InlineKeyboardButton("❌ انصراف", callback_data="del:no")])
+    await msg.reply_text("کدام ثبت حذف شود؟", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def on_delete_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not owner_only(update):
+        await q.answer("اجازه ندارید", show_alert=True)
+        return
+    await q.answer()
+    await q.edit_message_reply_markup(reply_markup=None)
+    if q.data == "del:no":
+        await q.message.reply_text("❌ لغو شد.")
+        return
+    r = await asyncio.to_thread(delete_entry, int(q.data.split(":")[1]))
+    if not r:
+        await q.message.reply_text("این ثبت قبلاً حذف شده بود.")
+        return
+    extra = " (از یک هفته‌ی بسته‌شده؛ جمع آن هفته به‌روز شد)" if r["closed"] else ""
+    await q.message.reply_text(f"🗑 حذف شد: {r['account']} — {fmt_gb(r['gb'])} — {r['owner']}{extra}")
+
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if msg is None or not await need_owner(update):
+        return
+    if msg.chat.type != "private":
+        await msg.reply_text("🔒 برای امنیت، بکاپ فقط در پیوی ربات فرستاده می‌شود. همین دستور را در پیوی ربات بزنید.")
+        return
+    path = await asyncio.to_thread(make_backup_file)
+    try:
+        with open(path, "rb") as f:
+            await msg.reply_document(
+                f,
+                filename=backup_name(),
+                caption="📦 بکاپ دیتابیس. برای ریستور همین فایل را در پیوی ربات بفرستید.",
+            )
+    finally:
+        os.remove(path)
+
+
+async def send_backup_to_owners(bot, caption):
+    path = await asyncio.to_thread(make_backup_file)
+    try:
+        for uid in OWNER_IDS:
+            try:
+                with open(path, "rb") as f:
+                    await bot.send_document(uid, f, filename=backup_name(), caption=caption)
+            except Exception as e:  # noqa: BLE001
+                log.debug("backup send failed: %s", e)
+    finally:
+        os.remove(path)
+
+
+async def handle_restore_file(msg, doc):
+    if doc.file_size and doc.file_size > 20 * 1024 * 1024:
+        await msg.reply_text("فایل بکاپ بزرگ‌تر از ۲۰ مگابایت است.")
+        return
+    tg_file = await doc.get_file()
+    await tg_file.download_to_drive(RESTORE_TMP)
+    info = await asyncio.to_thread(inspect_backup, RESTORE_TMP)
+    if "error" in info:
+        os.remove(RESTORE_TMP)
+        await msg.reply_text("❌ " + info["error"])
+        return
+    kb = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✅ ریستور", callback_data="rst:yes"),
+            InlineKeyboardButton("❌ انصراف", callback_data="rst:no"),
+        ]]
+    )
+    await msg.reply_text(
+        "📦 فایل بکاپ پیدا شد:\n"
+        f"• ثبت‌ها: {info['entries']}\n• هفته‌ها: {info['weeks']}\n• قیمت‌ها: {info['prices']}\n\n"
+        "⚠️ با ریستور، داده‌های فعلی با این فایل جایگزین می‌شوند "
+        "(قبلش یک نسخه‌ی ایمن از داده‌ی فعلی کنار دیتابیس ذخیره می‌شود). ادامه؟",
+        reply_markup=kb,
+    )
+
+
+async def on_restore_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not owner_only(update):
+        await q.answer("اجازه ندارید", show_alert=True)
+        return
+    await q.answer()
+    await q.edit_message_reply_markup(reply_markup=None)
+    if q.data == "rst:no":
+        if os.path.exists(RESTORE_TMP):
+            os.remove(RESTORE_TMP)
+        await q.message.reply_text("❌ ریستور لغو شد.")
+        return
+    if not os.path.exists(RESTORE_TMP):
+        await q.message.reply_text("فایل بکاپ پیدا نشد؛ دوباره بفرستید.")
+        return
+    try:
+        safety = await asyncio.to_thread(do_restore, RESTORE_TMP)
+    except Exception as e:  # noqa: BLE001
+        log.exception("restore failed")
+        await q.message.reply_text(f"❌ ریستور ناموفق بود: {e}")
+        return
+    await q.message.reply_text(
+        "✅ ریستور انجام شد."
+        + (f"\nنسخه‌ی قبلی داده‌ها اینجا ذخیره شد:\n{safety}" if safety else "")
+    )
+
+
 async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if u and update.effective_message:
@@ -998,6 +1692,7 @@ async def auto_close_tick(app, now=None):
     con = db()
     chats = con.execute("SELECT chat_id, thread_id FROM chats").fetchall()
     con.close()
+    closed_any = False
     for chat_id, thread_id in chats:
         w = close_week(chat_id, until=boundary)
         if not w:
@@ -1014,7 +1709,16 @@ async def auto_close_tick(app, now=None):
                 await app.bot.send_message(chat_id, c, message_thread_id=thread_id)
             except Exception as e:  # noqa: BLE001
                 log.warning("ارسال گزارش خودکار ناموفق: %s", e)
+        sc = sales_chunks(chat_id, w["id"], f"💰 فروش هفته {w['number']}")
+        for c in sc or []:
+            try:
+                await app.bot.send_message(chat_id, c, message_thread_id=thread_id)
+            except Exception as e:  # noqa: BLE001
+                log.warning("ارسال گزارش فروش ناموفق: %s", e)
+        closed_any = True
     set_state("last_boundary", boundary)
+    if closed_any and AUTO_BACKUP and OWNER_IDS:
+        await send_backup_to_owners(app.bot, "📦 بکاپ خودکار بعد از بستن هفته")
 
 
 async def auto_loop(app):
@@ -1042,6 +1746,13 @@ async def post_init(app: Application):
                 BotCommand("analyze", "تحلیل کامل"),
                 BotCommand("version", "نسخه‌ی ربات"),
                 BotCommand("update", "آپدیت ربات (مالک)"),
+                BotCommand("sales", "فروش به تومان"),
+                BotCommand("price", "قیمت‌ها"),
+                BotCommand("add", "افزودن دستی"),
+                BotCommand("remove", "حذف ثبت"),
+                BotCommand("backup", "بکاپ (پیوی)"),
+                BotCommand("status", "عیب‌یابی"),
+                BotCommand("help", "راهنما"),
             ]
         )
     except Exception as e:  # noqa: BLE001
@@ -1063,8 +1774,24 @@ def main():
     app.add_handler(CallbackQueryHandler(on_update_button, pattern=r"^upd:"))
     app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, on_document))
     app.add_handler(CallbackQueryHandler(on_close_button, pattern=r"^close:"))
+    for name, fn in (
+        ("help", cmd_help),
+        ("status", cmd_status),
+        ("sales", cmd_sales),
+        ("price", cmd_price),
+        ("userprice", cmd_userprice),
+        ("add", cmd_add),
+        ("remove", cmd_remove),
+        ("backup", cmd_backup),
+    ):
+        app.add_handler(CommandHandler(name, fn))
+    app.add_handler(CallbackQueryHandler(on_delete_button, pattern=r"^del:"))
+    app.add_handler(CallbackQueryHandler(on_restore_button, pattern=r"^rst:"))
+    app.add_handler(MessageHandler(filters.TEXT, pre_handler), group=-1)
     app.add_handler(
-        MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_text)
+        MessageHandler(
+            (filters.ChatType.GROUPS | filters.ChatType.CHANNEL) & filters.TEXT & ~filters.COMMAND, on_text
+        )
     )
     app.run_polling()
 
